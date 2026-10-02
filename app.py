@@ -238,16 +238,33 @@ def main():
             respuestas[p] = pedir_basica(p)
 
         conteo_folicular = None
+        usando_izquierdo = False
         if foliculo is not None:
             with st.expander("Paso 2 (opcional): ¿tienes una ecografía reciente?"):
                 st.caption(
                     "Si tienes el conteo de folículos de una ecografía reciente, agrégalo aquí. "
                     "Es un solo dato, pero mejora bastante la precisión de la estimación."
                 )
-                conteo_folicular = st.number_input(
-                    PREGUNTA_OPCIONAL, min_value=0, max_value=40, value=None, step=1,
-                    key="q_conteo_folicular",
+                sin_ovario_derecho = st.checkbox(
+                    "No tengo ovario derecho", key="q_sin_ovario_derecho"
                 )
+                if not sin_ovario_derecho:
+                    conteo_folicular = st.number_input(
+                        PREGUNTA_OPCIONAL, min_value=0, max_value=40, value=None, step=1,
+                        key="q_conteo_folicular",
+                    )
+                else:
+                    st.caption(
+                        "El modelo se entrenó con datos del ovario derecho. Si solo tienes el "
+                        "izquierdo, puedes usar ese conteo en su lugar: la estimación sigue siendo "
+                        "una aproximación, un poco menos precisa que si fuera el dato exacto con el "
+                        "que se entrenó el modelo."
+                    )
+                    conteo_folicular = st.number_input(
+                        "Conteo folicular (ovario izquierdo)", min_value=0, max_value=40,
+                        value=None, step=1, key="q_conteo_folicular_izq",
+                    )
+                    usando_izquierdo = conteo_folicular is not None
 
         enviado = st.form_submit_button("Calcular mi estimación")
 
@@ -285,7 +302,11 @@ def main():
     phi = aportes(paquete, fila)
     grupos_phi = agrupar(phi, paquete)
     st.write(explicar(grupos_phi, r))
-    if afinada:
+    if afinada and usando_izquierdo:
+        st.caption("Como incluiste el conteo folicular, tu estimación se apoya principalmente en ese dato. "
+                   "Al ser el conteo del ovario izquierdo usado en lugar del derecho, esta parte del "
+                   "resultado es una aproximación, no el dato exacto con el que se entrenó el modelo.")
+    elif afinada:
         st.caption("Como incluiste el conteo folicular, tu estimación se apoya principalmente en ese dato, "
                    "que es más preciso que los síntomas reportados por sí solos.")
     else:
