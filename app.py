@@ -1,13 +1,18 @@
 # =====================================================================
 # Prototipo: estimación de riesgo de SOP (proyecto de grado, EAN)
 # Recolección progresiva:
-#   - Paso 1 (obligatorio): 5 preguntas -> modelo corto (modelo_sop_corto.pkl)
-#   - Paso 2 (opcional):    las otras 9 preguntas -> modelo largo (modelo_sop.pkl),
-#                           solo si se responden todas.
-# Ambos son regresión logística calibrada, entrenada con el dataset de
-# Kottarathil (541 mujeres de Kerala, India).
+#   - Paso 1 (obligatorio): 5 preguntas no invasivas -> modelo_sop_corto.pkl
+#   - Paso 2 (opcional):    conteo folicular (ovario derecho), si la
+#                           usuaria tiene una ecografía reciente ->
+#                           modelo_sop_foliculo.pkl
+# Los tres modelos (corto, 14 preguntas y folículo) son regresión
+# logística calibrada, entrenada con el dataset de Kottarathil
+# (541 mujeres de Kerala, India). Esta versión usa corto + folículo,
+# porque una sola pregunta de ecografía supera a las 9 preguntas no
+# invasivas adicionales que probamos antes (ver notebook, Sección 8).
 # Ejecutar con:  streamlit run app.py
-# Archivos necesarios en la misma carpeta: modelo_sop_corto.pkl y modelo_sop.pkl
+# Archivos necesarios en la misma carpeta: modelo_sop_corto.pkl y
+# modelo_sop_foliculo.pkl
 # =====================================================================
 
 # ============================ NÚCLEO (lógica) ========================
@@ -16,62 +21,35 @@ import pandas as pd
 import joblib
 
 RUTA_CORTO = "modelo_sop_corto.pkl"
-RUTA_LARGO = "modelo_sop.pkl"
+RUTA_FOLICULO = "modelo_sop_foliculo.pkl"
 
 # Codificación tal como viene en el dataset de entrenamiento:
 #   Cycle(R/I): 2 = regular, 4 = irregular
 #   Variables Y/N: 1 = Sí, 0 = No
-#   Waist(inch) y Hip(inch) están en PULGADAS; peso en kg; estatura en cm
-#   Cycle length(days) toma valores de 2 a 12 (mediana 5): son los días de
-#   sangrado de la menstruación, no la duración total del ciclo.
+#   Follicle No. (R): conteo directo de folículos, mismo número que
+#   reportaría una ecografía (sin conversión de unidades).
 CICLO_REGULAR, CICLO_IRREGULAR = 2, 4
-CM_POR_PULGADA = 2.54
 
-RANGOS_DURACION = {
-    "1 a 3 días": (0, 3),
-    "4 a 5 días": (4, 5),
-    "6 a 7 días": (6, 7),
-    "8 días o más": (8, 99),
-}
-
-# Las 14 preguntas: nombre -> clave interna, en el orden en que se muestran.
+# Las 5 preguntas básicas, en el mismo orden que usa modelo_sop_corto.pkl
 PREGUNTAS = {
-    "Edad": "edad",
-    "Peso": "peso",
-    "Estatura": "estatura",
-    "Cintura": "cintura",
-    "Cadera": "cadera",
+    "Piel oscurecida": "piel",
     "Ciclo regular o irregular": "ciclo_irregular",
-    "Días de sangrado": "duracion",
     "Aumento de peso": "aumento_peso",
     "Crecimiento de vello": "vello",
-    "Piel oscurecida": "piel",
-    "Caída de cabello": "cabello",
     "Acné": "acne",
-    "Comida rápida": "comida_rapida",
-    "Ejercicio": "ejercicio",
 }
+PREGUNTA_OPCIONAL = "Conteo folicular (ovario derecho)"
+CLAVE_OPCIONAL = "conteo_folicular"
 
-# Variables muy correlacionadas (peso e IMC, r = 0.90) se suman en un solo
-# grupo, porque sus aportes individuales no se pueden leer por separado.
 GRUPOS = {
+    "Oscurecimiento de la piel": ["Skin darkening (Y/N)"],
     "Ciclo menstrual": ["Cycle(R/I)"],
-    "Duración de la menstruación": ["Cycle length(days)"],
     "Aumento de peso": ["Weight gain(Y/N)"],
     "Crecimiento de vello": ["hair growth(Y/N)"],
-    "Oscurecimiento de la piel": ["Skin darkening (Y/N)"],
-    "Caída de cabello": ["Hair loss(Y/N)"],
     "Acné": ["Pimples(Y/N)"],
-    "Medidas corporales": ["Weight (Kg)", "Height(Cm)", "BMI", "Waist(inch)",
-                           "Hip(inch)", "Waist:Hip Ratio"],
-    "Edad": ["Age (yrs)"],
-    "Hábitos": ["Fast food (Y/N)", "Reg.Exercise(Y/N)"],
+    "Conteo folicular": ["Follicle No. (R)"],
 }
 UMBRAL_APORTE = 0.10
-# Entran al cálculo pero no se mencionan en el texto: su efecto en el modelo
-# largo va en contra de lo esperable (caída de cabello) o refleja asociaciones
-# indirectas de los datos (hábitos).
-NO_MENCIONAR = ["Hábitos", "Caída de cabello"]
 
 CATEGORIAS = [
     (20, "Bajo", "#2e7d32"),
@@ -99,43 +77,17 @@ def rangos_entrenamiento(paquete):
     return {c: (crudo[c].min(), crudo[c].max()) for c in crudo.columns}
 
 
-def valor_por_rango(paquete_largo):
-    """Valor que se le asigna a cada rango de días de sangrado (mediana observada)."""
-    dias = valores_crudos(paquete_largo)["Cycle length(days)"].round()
-    mapa = {}
-    for nombre, (lo, hi) in RANGOS_DURACION.items():
-        en_rango = dias[(dias >= lo) & (dias <= hi)]
-        mapa[nombre] = float(en_rango.median()) if len(en_rango) else float((lo + min(hi, lo + 4)) / 2)
-    return mapa
-
-
-def construir_fila(paquete, r, duraciones=None):
+def construir_fila(paquete, r):
     """Arma la fila del modelo con las respuestas disponibles en r."""
-    f = {}
-    if "edad" in r:
-        f["Age (yrs)"] = r["edad"]
-    if "peso" in r:
-        f["Weight (Kg)"] = r["peso"]
-    if "estatura" in r:
-        f["Height(Cm)"] = r["estatura"]
-    if "peso" in r and "estatura" in r:
-        f["BMI"] = r["peso"] / (r["estatura"] / 100) ** 2
-    if "cintura" in r:
-        f["Waist(inch)"] = r["cintura"] / CM_POR_PULGADA
-    if "cadera" in r:
-        f["Hip(inch)"] = r["cadera"] / CM_POR_PULGADA
-    if "cintura" in r and "cadera" in r:
-        f["Waist:Hip Ratio"] = r["cintura"] / r["cadera"]
-    if "ciclo_irregular" in r:
-        f["Cycle(R/I)"] = CICLO_IRREGULAR if r["ciclo_irregular"] else CICLO_REGULAR
-    if "duracion" in r:
-        f["Cycle length(days)"] = duraciones[r["duracion"]]
-    for clave, col in [("aumento_peso", "Weight gain(Y/N)"), ("vello", "hair growth(Y/N)"),
-                       ("piel", "Skin darkening (Y/N)"), ("cabello", "Hair loss(Y/N)"),
-                       ("acne", "Pimples(Y/N)"), ("comida_rapida", "Fast food (Y/N)"),
-                       ("ejercicio", "Reg.Exercise(Y/N)")]:
-        if clave in r:
-            f[col] = int(r[clave])
+    f = {
+        "Skin darkening (Y/N)": int(r["piel"]),
+        "Cycle(R/I)": CICLO_IRREGULAR if r["ciclo_irregular"] else CICLO_REGULAR,
+        "Weight gain(Y/N)": int(r["aumento_peso"]),
+        "hair growth(Y/N)": int(r["vello"]),
+        "Pimples(Y/N)": int(r["acne"]),
+    }
+    if "conteo_folicular" in r:
+        f["Follicle No. (R)"] = r["conteo_folicular"]
     return pd.DataFrame([f])[paquete["columnas"]]
 
 
@@ -166,10 +118,9 @@ def agrupar(phi, paquete):
 def fuera_de_rango(paquete, fila):
     avisos = []
     for col, (lo, hi) in rangos_entrenamiento(paquete).items():
-        if col in ("Age (yrs)", "Weight (Kg)", "Height(Cm)", "BMI", "Waist(inch)", "Hip(inch)"):
-            v = float(fila[col].iloc[0])
-            if v < lo - 1e-9 or v > hi + 1e-9:
-                avisos.append(col)
+        v = float(fila[col].iloc[0])
+        if v < lo - 1e-9 or v > hi + 1e-9:
+            avisos.append(col)
     return avisos
 
 
@@ -184,14 +135,12 @@ def frase_respuesta(grupo, r):
     """Describe la respuesta de la usuaria en ese grupo, sin lenguaje causal."""
     si = lambda x, a, b: a if x else b
     frases = {
+        "Oscurecimiento de la piel": lambda: si(r["piel"], "tener", "no tener") + " oscurecimiento de la piel",
         "Ciclo menstrual": lambda: "tener ciclos " + si(r["ciclo_irregular"], "irregulares", "regulares"),
-        "Duración de la menstruación": lambda: "una menstruación de " + r["duracion"],
         "Aumento de peso": lambda: si(r["aumento_peso"], "haber notado", "no haber notado") + " aumento de peso",
         "Crecimiento de vello": lambda: si(r["vello"], "tener", "no tener") + " crecimiento excesivo de vello",
-        "Oscurecimiento de la piel": lambda: si(r["piel"], "tener", "no tener") + " oscurecimiento de la piel",
         "Acné": lambda: si(r["acne"], "tener", "no tener") + " acné persistente",
-        "Medidas corporales": lambda: "tus medidas corporales (peso, estatura, cintura y cadera)",
-        "Edad": lambda: "tu edad",
+        "Conteo folicular": lambda: "el conteo folicular que reportaste en tu ecografía",
     }
     return frases[grupo]()
 
@@ -203,9 +152,8 @@ def unir(items):
 
 
 def explicar(grupos_phi, r):
-    g = grupos_phi.drop(NO_MENCIONAR, errors="ignore")
-    suben = g[g >= UMBRAL_APORTE].sort_values(ascending=False).head(3)
-    bajan = g[g <= -UMBRAL_APORTE].sort_values().head(3)
+    suben = grupos_phi[grupos_phi >= UMBRAL_APORTE].sort_values(ascending=False).head(3)
+    bajan = grupos_phi[grupos_phi <= -UMBRAL_APORTE].sort_values().head(3)
     partes = []
     if len(suben):
         partes.append("Lo que más aumentó tu estimación: "
@@ -244,10 +192,10 @@ import streamlit.components.v1 as components
 def _paquetes():
     corto = cargar_paquete(RUTA_CORTO)
     try:
-        largo = cargar_paquete(RUTA_LARGO)
+        foliculo = cargar_paquete(RUTA_FOLICULO)
     except FileNotFoundError:
-        largo = None
-    return corto, largo
+        foliculo = None
+    return corto, foliculo
 
 
 def _si_no(etiqueta, clave):
@@ -255,44 +203,25 @@ def _si_no(etiqueta, clave):
     return None if resp is None else (resp == "Sí")
 
 
-def pedir(pregunta):
-    """Dibuja el campo de una pregunta. Devuelve la respuesta, o None si está sin responder."""
+def pedir_basica(pregunta):
     clave = "q_" + PREGUNTAS[pregunta]
-    if pregunta == "Edad":
-        return st.number_input("Edad (años)", min_value=15, max_value=60, value=None, step=1, key=clave)
-    if pregunta == "Peso":
-        return st.number_input("Peso (kg)", min_value=30, max_value=200, value=None, step=1, key=clave)
-    if pregunta == "Estatura":
-        return st.number_input("Estatura (cm)", min_value=120, max_value=210, value=None, step=1, key=clave)
-    if pregunta == "Cintura":
-        return st.number_input("Cintura (cm)", min_value=50, max_value=160, value=None, step=1, key=clave)
-    if pregunta == "Cadera":
-        return st.number_input("Cadera (cm)", min_value=60, max_value=170, value=None, step=1, key=clave)
+    textos = {
+        "Piel oscurecida": "¿Tienes zonas de piel oscurecida (cuello, axilas o ingles)?",
+        "Ciclo regular o irregular": None,  # caso especial, radio de dos opciones con texto propio
+        "Aumento de peso": "¿Has notado aumento de peso que te cuesta controlar?",
+        "Crecimiento de vello": "¿Tienes crecimiento excesivo de vello (rostro, pecho o espalda)?",
+        "Acné": "¿Tienes acné persistente?",
+    }
     if pregunta == "Ciclo regular o irregular":
         resp = st.radio("Tus ciclos menstruales son:", ["Regulares", "Irregulares"],
                         index=None, horizontal=True, key=clave)
         return None if resp is None else (resp == "Irregulares")
-    if pregunta == "Días de sangrado":
-        return st.radio("¿Cuántos días dura normalmente tu menstruación (días de sangrado)?",
-                        list(RANGOS_DURACION.keys()), index=None, horizontal=True, key=clave)
-    textos = {
-        "Aumento de peso": "¿Has notado aumento de peso que te cuesta controlar?",
-        "Crecimiento de vello": "¿Tienes crecimiento excesivo de vello (rostro, pecho o espalda)?",
-        "Piel oscurecida": "¿Tienes zonas de piel oscurecida (cuello, axilas o ingles)?",
-        "Caída de cabello": "¿Has notado caída de cabello inusual?",
-        "Acné": "¿Tienes acné persistente?",
-        "Comida rápida": "¿Consumes comida rápida con frecuencia?",
-        "Ejercicio": "¿Haces ejercicio de forma regular?",
-    }
     return _si_no(textos[pregunta], clave)
 
 
 def main():
     st.set_page_config(page_title="Estimación de riesgo de SOP", page_icon="🩺", layout="centered")
-    corto, largo = _paquetes()
-
-    basicas = [p for p in PREGUNTAS if p in corto["preguntas"]]
-    opcionales = [p for p in PREGUNTAS if p not in corto["preguntas"]]
+    corto, foliculo = _paquetes()
 
     st.title("Estimación de riesgo de SOP")
     st.caption("Prototipo académico · Proyecto de grado, Universidad EAN")
@@ -304,48 +233,46 @@ def main():
 
     respuestas = {}
     with st.form("formulario"):
-        st.subheader(f"Paso 1: {len(basicas)} preguntas básicas")
-        for p in basicas:
-            respuestas[p] = pedir(p)
+        st.subheader("Paso 1: 5 preguntas básicas")
+        for p in PREGUNTAS:
+            respuestas[p] = pedir_basica(p)
 
-        if largo is not None:
-            with st.expander(f"Paso 2 (opcional): afina tu estimación con {len(opcionales)} preguntas más"):
-                st.caption(f"Si respondes las {len(opcionales)} preguntas, la estimación usa más información. "
-                           "Si dejas alguna sin responder, se usa solo el Paso 1.")
-                for p in opcionales:
-                    respuestas[p] = pedir(p)
+        conteo_folicular = None
+        if foliculo is not None:
+            with st.expander("Paso 2 (opcional): ¿tienes una ecografía reciente?"):
+                st.caption(
+                    "Si tienes el conteo de folículos de una ecografía reciente, agrégalo aquí. "
+                    "Es un solo dato, pero mejora bastante la precisión de la estimación."
+                )
+                conteo_folicular = st.number_input(
+                    PREGUNTA_OPCIONAL, min_value=0, max_value=40, value=None, step=1,
+                    key="q_conteo_folicular",
+                )
 
         enviado = st.form_submit_button("Calcular mi estimación")
 
     if not enviado:
         return
 
-    if any(respuestas[p] is None for p in basicas):
+    if any(respuestas[p] is None for p in PREGUNTAS):
         st.error("Por favor responde las preguntas básicas del Paso 1 para calcular la estimación.")
         return
 
-    contestadas_opc = [p for p in opcionales if respuestas.get(p) is not None]
-    afinada = largo is not None and len(contestadas_opc) == len(opcionales)
-    if largo is not None and contestadas_opc and not afinada:
-        st.info(f"Respondiste {len(contestadas_opc)} de {len(opcionales)} preguntas del Paso 2. "
-                "Para afinar la estimación se necesitan todas, así que este resultado usa solo el Paso 1.")
-
+    afinada = foliculo is not None and conteo_folicular is not None
+    paquete = foliculo if afinada else corto
+    r = {PREGUNTAS[p]: respuestas[p] for p in PREGUNTAS}
     if afinada:
-        paquete, usadas = largo, list(PREGUNTAS)
-    else:
-        paquete, usadas = corto, basicas
-    r = {PREGUNTAS[p]: respuestas[p] for p in usadas}
+        r[CLAVE_OPCIONAL] = conteo_folicular
 
-    duraciones = valor_por_rango(largo) if afinada else None
-    fila = construir_fila(paquete, r, duraciones)
+    fila = construir_fila(paquete, r)
     prob = estimar_riesgo(paquete, fila)
     pct = int(round(prob * 100))
     nombre, color = categoria(pct)
 
     st.divider()
     st.subheader("Tu resultado")
-    st.caption("Estimación afinada con las 14 preguntas" if afinada
-               else f"Estimación básica con {len(basicas)} preguntas")
+    st.caption("Estimación afinada con el conteo folicular" if afinada
+               else "Estimación básica con 5 preguntas")
     components.html(svg_dona(pct, color), height=240)
     st.markdown(f"<h3 style='text-align:center;color:{color}'>Riesgo estimado: {nombre}</h3>",
                 unsafe_allow_html=True)
@@ -353,17 +280,14 @@ def main():
     fuera = fuera_de_rango(paquete, fila)
     if fuera:
         st.warning("Algunos de tus datos (" + ", ".join(fuera) + ") están fuera del rango de las "
-                   "mujeres con las que se entrenó el modelo (20 a 48 años). "
-                   "La estimación puede ser menos confiable.")
+                   "mujeres con las que se entrenó el modelo. La estimación puede ser menos confiable.")
 
     phi = aportes(paquete, fila)
     grupos_phi = agrupar(phi, paquete)
     st.write(explicar(grupos_phi, r))
     if afinada:
-        st.caption("Esto describe cómo el modelo usó tus respuestas; no son causas médicas. "
-                   "Tus respuestas sobre hábitos (comida rápida y ejercicio) y caída de cabello también entran "
-                   "en el cálculo, pero en los datos de entrenamiento se relacionan con el resultado de forma "
-                   "indirecta, por eso no se destacan.")
+        st.caption("Como incluiste el conteo folicular, tu estimación se apoya principalmente en ese dato, "
+                   "que es más preciso que los síntomas reportados por sí solos.")
     else:
         st.caption("Esto describe cómo el modelo usó tus respuestas; no son causas médicas.")
 
