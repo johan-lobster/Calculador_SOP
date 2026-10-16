@@ -5,165 +5,26 @@
 #   - Paso 2 (opcional):    conteo folicular (ovario derecho), si la
 #                           usuaria tiene una ecografía reciente ->
 #                           modelo_sop_foliculo.pkl
-# Los tres modelos (corto, 14 preguntas y folículo) son regresión
-# logística calibrada, entrenada con el dataset de Kottarathil
-# (541 mujeres de Kerala, India). Esta versión usa corto + folículo,
-# porque una sola pregunta de ecografía supera a las 9 preguntas no
-# invasivas adicionales que probamos antes (ver notebook, Sección 8).
+# Organización del código:
+#   modelo.py      lógica del modelo (carga, fila, probabilidad, categorías)
+#   explicacion.py por qué cada respuesta sube o baja la estimación
+#   app.py         interfaz (este archivo)
 # Ejecutar con:  streamlit run app.py
-# Archivos necesarios en la misma carpeta: modelo_sop_corto.pkl y
-# modelo_sop_foliculo.pkl
 # =====================================================================
-
-# ============================ NÚCLEO (lógica) ========================
-import numpy as np
-import pandas as pd
-import joblib
-
-RUTA_CORTO = "modelo_sop_corto.pkl"
-RUTA_FOLICULO = "modelo_sop_foliculo.pkl"
-
-# Codificación tal como viene en el dataset de entrenamiento:
-#   Cycle(R/I): 2 = regular, 4 = irregular
-#   Variables Y/N: 1 = Sí, 0 = No
-#   Follicle No. (R): conteo directo de folículos, mismo número que
-#   reportaría una ecografía (sin conversión de unidades).
-CICLO_REGULAR, CICLO_IRREGULAR = 2, 4
-
-# Las 5 preguntas básicas, en el mismo orden que usa modelo_sop_corto.pkl
-PREGUNTAS = {
-    "Piel oscurecida": "piel",
-    "Ciclo regular o irregular": "ciclo_irregular",
-    "Aumento de peso": "aumento_peso",
-    "Crecimiento de vello": "vello",
-    "Acné": "acne",
-}
-PREGUNTA_OPCIONAL = "Conteo folicular (ovario derecho)"
-CLAVE_OPCIONAL = "conteo_folicular"
-
-GRUPOS = {
-    "Oscurecimiento de la piel": ["Skin darkening (Y/N)"],
-    "Ciclo menstrual": ["Cycle(R/I)"],
-    "Aumento de peso": ["Weight gain(Y/N)"],
-    "Crecimiento de vello": ["hair growth(Y/N)"],
-    "Acné": ["Pimples(Y/N)"],
-    "Conteo folicular": ["Follicle No. (R)"],
-}
-UMBRAL_APORTE = 0.10
-
-CATEGORIAS = [
-    (20, "Bajo", "#2e7d32"),
-    (40, "Medio-bajo", "#7cb342"),
-    (60, "Medio", "#f9a825"),
-    (80, "Medio-alto", "#ef6c00"),
-    (100, "Alto", "#c62828"),
-]
-PORCENTAJE_RECOMENDAR_CONSULTA = 41
-
-
-def cargar_paquete(ruta):
-    return joblib.load(ruta)
-
-
-def valores_crudos(paquete):
-    """Dataset de entrenamiento en unidades originales."""
-    scaler = paquete["pipeline_base"].named_steps["scaler"]
-    fondo = paquete["fondo_shap"]
-    return pd.DataFrame(fondo.values * scaler.scale_ + scaler.mean_, columns=fondo.columns)
-
-
-def rangos_entrenamiento(paquete):
-    crudo = valores_crudos(paquete)
-    return {c: (crudo[c].min(), crudo[c].max()) for c in crudo.columns}
-
-
-def construir_fila(paquete, r):
-    """Arma la fila del modelo con las respuestas disponibles en r."""
-    f = {
-        "Skin darkening (Y/N)": int(r["piel"]),
-        "Cycle(R/I)": CICLO_IRREGULAR if r["ciclo_irregular"] else CICLO_REGULAR,
-        "Weight gain(Y/N)": int(r["aumento_peso"]),
-        "hair growth(Y/N)": int(r["vello"]),
-        "Pimples(Y/N)": int(r["acne"]),
-    }
-    if "conteo_folicular" in r:
-        f["Follicle No. (R)"] = r["conteo_folicular"]
-    return pd.DataFrame([f])[paquete["columnas"]]
-
-
-def estimar_riesgo(paquete, fila):
-    """Probabilidad calibrada de SOP (0 a 1)."""
-    return float(paquete["modelo_calibrado"].predict_proba(fila)[0, 1])
-
-
-def aportes(paquete, fila):
-    """
-    Valores SHAP de la regresión logística. En un modelo lineal, el valor SHAP
-    exacto de cada variable es coeficiente * (valor estandarizado - promedio
-    del fondo), que es lo que calcula shap.LinearExplainer.
-    """
-    pipe = paquete["pipeline_base"]
-    x = pipe.named_steps["scaler"].transform(fila)[0]
-    promedio = paquete["fondo_shap"].mean(axis=0).values
-    phi = pipe.named_steps["modelo"].coef_[0] * (x - promedio)
-    return pd.Series(phi, index=paquete["columnas"])
-
-
-def agrupar(phi, paquete):
-    cols = set(paquete["columnas"])
-    return pd.Series({g: phi[[c for c in cs if c in cols]].sum()
-                      for g, cs in GRUPOS.items() if any(c in cols for c in cs)})
-
-
-def fuera_de_rango(paquete, fila):
-    avisos = []
-    for col, (lo, hi) in rangos_entrenamiento(paquete).items():
-        v = float(fila[col].iloc[0])
-        if v < lo - 1e-9 or v > hi + 1e-9:
-            avisos.append(col)
-    return avisos
-
-
-def categoria(pct):
-    for limite, nombre, color in CATEGORIAS:
-        if pct <= limite:
-            return nombre, color
-    return CATEGORIAS[-1][1], CATEGORIAS[-1][2]
-
-
-def frase_respuesta(grupo, r):
-    """Describe la respuesta de la usuaria en ese grupo, sin lenguaje causal."""
-    si = lambda x, a, b: a if x else b
-    frases = {
-        "Oscurecimiento de la piel": lambda: si(r["piel"], "tener", "no tener") + " oscurecimiento de la piel",
-        "Ciclo menstrual": lambda: "tener ciclos " + si(r["ciclo_irregular"], "irregulares", "regulares"),
-        "Aumento de peso": lambda: si(r["aumento_peso"], "haber notado", "no haber notado") + " aumento de peso",
-        "Crecimiento de vello": lambda: si(r["vello"], "tener", "no tener") + " crecimiento excesivo de vello",
-        "Acné": lambda: si(r["acne"], "tener", "no tener") + " acné persistente",
-        "Conteo folicular": lambda: "el conteo folicular que reportaste en tu ecografía",
-    }
-    return frases[grupo]()
-
-
-def unir(items):
-    if len(items) <= 1:
-        return "".join(items)
-    return ", ".join(items[:-1]) + " y " + items[-1]
-
-
-def explicar(grupos_phi, r):
-    suben = grupos_phi[grupos_phi >= UMBRAL_APORTE].sort_values(ascending=False).head(3)
-    bajan = grupos_phi[grupos_phi <= -UMBRAL_APORTE].sort_values().head(3)
-    partes = []
-    if len(suben):
-        partes.append("Lo que más aumentó tu estimación: "
-                      + unir([frase_respuesta(k, r) for k in suben.index]) + ".")
-    if len(bajan):
-        partes.append("Lo que más la disminuyó: "
-                      + unir([frase_respuesta(k, r) for k in bajan.index]) + ".")
-    if not partes:
-        partes.append("Ninguna de tus respuestas tuvo un peso destacado por sí sola.")
-    return " ".join(partes)
+from modelo import (
+    CLAVE_OPCIONAL,
+    PORCENTAJE_RECOMENDAR_CONSULTA,
+    PREGUNTA_OPCIONAL,
+    PREGUNTAS,
+    RUTA_CORTO,
+    RUTA_FOLICULO,
+    cargar_paquete,
+    categoria,
+    construir_fila,
+    estimar_riesgo,
+    fuera_de_rango,
+)
+from explicacion import analisis_general, construir_explicacion, svg_cascada
 
 
 def svg_dona(pct, color):
@@ -231,18 +92,24 @@ def main():
         "Tus respuestas no se guardan."
     )
 
-    respuestas = {}
-    with st.form("formulario"):
-        st.subheader("Paso 1: 5 preguntas básicas")
-        for p in PREGUNTAS:
-            respuestas[p] = pedir_basica(p)
-        enviado = st.form_submit_button("Calcular mi estimación")
+    sin_ovarios = st.checkbox("No tengo ovarios (por cirugía u otra causa)", key="q_sin_ovarios")
+    if sin_ovarios:
+        st.info(
+            "Esta herramienta estima el riesgo de SOP, una condición que depende de los ovarios y "
+            "de la ovulación, así que no aplica en tu caso. Si tienes dudas sobre tu salud hormonal "
+            "o metabólica, puedes consultar con ginecología o endocrinología."
+        )
+        return
 
-    # El Paso 2 va FUERA del formulario a propósito: dentro de un st.form,
-    # los widgets no se actualizan entre sí hasta enviar el formulario, así
-    # que el checkbox no podría cambiar en vivo qué campo se muestra. Fuera
-    # del form, Streamlit sigue recordando estos valores cuando se presiona
-    # "Calcular mi estimación" de arriba.
+    respuestas = {}
+    st.subheader("Paso 1: 5 preguntas básicas")
+    for p in PREGUNTAS:
+        respuestas[p] = pedir_basica(p)
+
+    # Los pasos van fuera de un st.form a propósito: dentro de un formulario los
+    # widgets no se actualizan entre sí hasta enviar, y la casilla "No tengo
+    # ovario derecho" necesita cambiar en vivo qué campo se muestra. El botón
+    # de calcular va al final, después del Paso 2.
     conteo_folicular = None
     usando_izquierdo = False
     if foliculo is not None:
@@ -271,6 +138,8 @@ def main():
                     value=None, step=1, key="q_conteo_folicular_izq",
                 )
                 usando_izquierdo = conteo_folicular is not None
+
+    enviado = st.button("Calcular mi estimación", type="primary")
 
     if not enviado:
         return
@@ -303,9 +172,22 @@ def main():
         st.warning("Algunos de tus datos (" + ", ".join(fuera) + ") están fuera del rango de las "
                    "mujeres con las que se entrenó el modelo. La estimación puede ser menos confiable.")
 
-    phi = aportes(paquete, fila)
-    grupos_phi = agrupar(phi, paquete)
-    st.write(explicar(grupos_phi, r))
+    explicacion = construir_explicacion(paquete, fila)
+
+    st.subheader("Por qué salió este resultado")
+    st.caption("La cuenta parte de 0 %. Primero se suma el riesgo mínimo que da el modelo aun "
+               "sin ninguna señal y luego cada respuesta suma puntos hasta llegar a tu estimación.")
+    svg, alto = svg_cascada(explicacion)
+    components.html(svg, height=alto + 10)
+
+    for item in explicacion["items"]:
+        st.markdown("**" + ("▲ " if item["puntos"] >= 0 else "▼ ") + item["frase"] + "**")
+        st.caption(item["razon"])
+    if explicacion["menores"]:
+        st.markdown("Otras respuestas casi no cambiaron el resultado.")
+
+    st.subheader("En resumen")
+    st.write(analisis_general(pct, explicacion))
     if afinada and usando_izquierdo:
         st.caption("Como incluiste el conteo folicular, tu estimación se apoya principalmente en ese dato. "
                    "Al ser el conteo del ovario izquierdo usado en lugar del derecho, esta parte del "
@@ -314,17 +196,12 @@ def main():
         st.caption("Como incluiste el conteo folicular, tu estimación se apoya principalmente en ese dato, "
                    "que es más preciso que los síntomas reportados por sí solos.")
     else:
-        st.caption("Esto describe cómo el modelo usó tus respuestas; no son causas médicas.")
+        st.caption("Esto describe asociaciones que encontró el modelo; no son causas médicas.")
 
     if pct >= PORCENTAJE_RECOMENDAR_CONSULTA:
         st.warning("Te recomendamos consultar con un profesional de la salud para una valoración adecuada.")
     else:
         st.success("Si tienes síntomas o dudas que te preocupen, consulta con un profesional de la salud.")
-
-    with st.expander("¿Cómo se calculó? (detalle técnico)"):
-        st.write("Aporte de cada grupo de respuestas a la estimación (valores SHAP, en escala logit). "
-                 "Positivo: aumenta la estimación; negativo: la disminuye.")
-        st.bar_chart(grupos_phi.round(3))
 
     st.caption("Prototipo entrenado con datos de 541 mujeres de Kerala, India. "
                "No ha sido validado en población colombiana.")
