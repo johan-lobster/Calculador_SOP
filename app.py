@@ -314,7 +314,25 @@ def ilustracion_botanica():
 
 
 # ====================================================== INTERFAZ (Streamlit)
+import inspect
+
 import streamlit as st
+
+
+def _ancho_completo():
+    """Argumento de ancho completo según la versión de Streamlit (width="stretch" o use_container_width)."""
+    try:
+        params = inspect.signature(st.button).parameters
+    except (TypeError, ValueError):
+        return {}
+    if "width" in params:
+        return {"width": "stretch"}
+    if "use_container_width" in params:
+        return {"use_container_width": True}
+    return {}
+
+
+FULL = _ancho_completo()
 
 CSS = """
 <style>
@@ -453,7 +471,8 @@ a { color: var(--salvia-oscuro); }
 @media (max-width: 420px) { .lin { width: 30px; } }
 
 /* ---------- Botones ---------- */
-.stButton > button, .stDownloadButton > button {
+.stButton > button, .stDownloadButton > button, [data-testid="stButton"] > button,
+[data-testid="stDownloadButton"] > button {
   min-height: 52px; border-radius: 14px; font-size: 17px; font-weight: 600; width: 100%;
   border: 1.5px solid var(--salvia); background: #fff; color: var(--pizarra); box-shadow: none;
 }
@@ -473,6 +492,17 @@ button:focus-visible { outline: 3px solid #7E5F7A !important; outline-offset: 2p
   font-size: 15px !important; font-weight: 500 !important; text-decoration: underline; color: var(--pizarra-2) !important;
 }
 
+/* El contenedor del botón también debe ocupar todo el ancho de su columna */
+.stButton, [data-testid="stButton"], .stDownloadButton, [data-testid="stDownloadButton"] { width: 100% !important; }
+.st-key-tabs .stButton, .st-key-tabs [data-testid="stButton"],
+.st-key-comenzar .stButton, .st-key-comenzar [data-testid="stButton"] { width: auto !important; }
+@media (max-width: 640px) {
+  .st-key-comenzar .stButton, .st-key-comenzar [data-testid="stButton"] { width: 100% !important; }
+}
+/* Los títulos de Streamlit traen su propia fuente: forzar Inter */
+h1, h2, h3, h4, [data-testid="stHeading"], [data-testid="stHeading"] *, .sop-h1, .sop-h2, .sop-t1 {
+  font-family: 'Inter', system-ui, -apple-system, 'Segoe UI', Arial, sans-serif !important;
+}
 /* Sí / No: anchos, siempre lado a lado, seleccionado en degradado salvia */
 .st-key-yesno button, .st-key-yesno button[kind="secondary"] {
   min-height: 64px; border-radius: 16px; font-size: 18px; font-weight: 700;
@@ -756,7 +786,7 @@ def pantalla_pregunta_obligatoria(paso):
                     elegido = actual is not None and actual == valor
                     st.button(
                         ("✓ " if elegido else "") + etiqueta,
-                        key=f"r_{q['clave']}_{int(valor)}",
+                        key=f"r_{q['clave']}_{int(valor)}", **FULL,
                         type="primary" if elegido else "secondary",
                         on_click=responder, args=(q["clave"], valor),
                     )
@@ -767,9 +797,9 @@ def pantalla_pregunta_obligatoria(paso):
             a, b = st.columns(2)
             with a:
                 if paso > 0:
-                    st.button("← Anterior", key="btn_ant", on_click=ir, kwargs=dict(paso=paso - 1))
+                    st.button("← Anterior", key="btn_ant", **FULL, on_click=ir, kwargs=dict(paso=paso - 1))
             with b:
-                st.button("Siguiente →", key="btn_sig", type="primary", on_click=ir, kwargs=dict(paso=paso + 1))
+                st.button("Siguiente →", key="btn_sig", **FULL, type="primary", on_click=ir, kwargs=dict(paso=paso + 1))
     aviso_etico_centrado()
 
 
@@ -827,9 +857,9 @@ def pantalla_pregunta_opcional(hay_foliculo):
         with st.container(key="nav"):
             a, b = st.columns(2)
             with a:
-                st.button("← Anterior", key="btn_ant6", on_click=ir, kwargs=dict(paso=N_OBLIGATORIAS - 1))
+                st.button("← Anterior", key="btn_ant6", **FULL, on_click=ir, kwargs=dict(paso=N_OBLIGATORIAS - 1))
             with b:
-                calcular = st.button("Calcular mi estimación", key="btn_calc", type="primary")
+                calcular = st.button("Calcular mi estimación", key="btn_calc", **FULL, type="primary")
     aviso_etico_centrado()
     if calcular:
         calcular_resultado()
@@ -1051,28 +1081,28 @@ def pantalla_resultado():
             st.download_button(
                 "Descargar informe en PDF", data=pdf,
                 file_name=f"informe_estimacion_sop_{date.today().isoformat()}.pdf",
-                mime="application/pdf", key="btn_pdf", type="primary",
+                mime="application/pdf", key="btn_pdf", **FULL, type="primary",
             )
         else:  # sin reportlab o sin poder generarlo: el .txt queda como principal
             st.download_button(
                 "Descargar resumen en texto (.txt)", data=texto_resumen(res, ss.resp),
-                file_name="resumen_estimacion_sop.txt", mime="text/plain", key="btn_descarga_txt0",
+                file_name="resumen_estimacion_sop.txt", mime="text/plain", key="btn_descarga_txt0", **FULL,
                 type="primary",
             )
     with b:
-        st.button("Volver a empezar", key="btn_reiniciar", on_click=reiniciar)
+        st.button("Volver a empezar", key="btn_reiniciar", **FULL, on_click=reiniciar)
     if pdf is not None:
         st.download_button(
             "Descargar versión en texto (.txt)", data=texto_resumen(res, ss.resp),
-            file_name="resumen_estimacion_sop.txt", mime="text/plain", key="btn_descarga_txt",
+            file_name="resumen_estimacion_sop.txt", mime="text/plain", key="btn_descarga_txt", **FULL,
         )
     st.caption("El informe se genera en este momento; no se guarda en ningún servidor.")
     with st.container(key="sutil"):
         x, y = st.columns(2)
         with x:
-            st.button("Cambiar mis respuestas", key="btn_cambiar", on_click=ir, args=("preguntas", 0))
+            st.button("Cambiar mis respuestas", key="btn_cambiar", **FULL, on_click=ir, args=("preguntas", 0))
         with y:
-            st.button("Quiero aprender más sobre el SOP →", key="btn_aprende", on_click=ir_vista, args=("aprende",))
+            st.button("Quiero aprender más sobre el SOP →", key="btn_aprende", **FULL, on_click=ir_vista, args=("aprende",))
 
 
 # ----------------------------------------------------------- Aprende más
@@ -1166,7 +1196,7 @@ def pestana_aprende_mas():
     # 8. Volver
     _, centro, _ = st.columns([1, 2, 1])
     with centro:
-        st.button("← Volver a mi estimación", key="btn_volver", on_click=ir_vista, args=("estimacion",))
+        st.button("← Volver a mi estimación", key="btn_volver", **FULL, on_click=ir_vista, args=("estimacion",))
 
 
 # ----------------------------------------------------------- principal
